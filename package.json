@@ -1,7 +1,7 @@
 {
   "name": "brainrot-api",
-  "version": "1.0.0",
-  "description": "Brainrot API with claim/locks to avoid multi-bot collisions",
+  "version": "2.0.0",
+  "description": "Brainrot API ultra-fast feeder + claim/locks (anti-collision for 100+ bots)",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -10,5 +10,8 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
