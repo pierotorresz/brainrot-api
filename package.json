@@ -1,7 +1,7 @@
 {
   "name": "brainrot-api",
   "version": "1.0.0",
-  "description": "Brainrot API with claim/locks to prevent multiple bots joining same server",
+  "description": "Brainrot API with claim/locks to avoid multi-bot collisions",
   "main": "index.js",
   "type": "module",
   "scripts": {
