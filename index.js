@@ -1,18 +1,18 @@
-// Brainrot API — ULTRA FEEDER + CLAIM/LOCKS (anti-colisión 100+ bots)
-// Piero + Joszz (adapt). Render 1 sola instancia. PlaceId: 109983668079237
+// Brainrot API — ULTRA FEEDER + CLAIM/LOCKS + (FIX) poda rápida + filtrar vacíos
+// PlaceId fijo: 109983668079237
 
 import express from "express";
 import cors from "cors";
 import http from "node:http";
 import https from "node:https";
 
-// ===== Config =====
-const PLACE_ID  = 109983668079237;                 // << fijo para ti
+const PLACE_ID  = 109983668079237;
 const POLL_MS   = Math.max(200, Number(process.env.POLL_MS || 350)); // ~0.35s
 const MAX_PAGES = Math.max(1, Math.min(6, Number(process.env.MAX_PAGES || 3)));
-const KEEP_MIN  = 30 * 60 * 1000; // retener 30 min
 
-// Agentes keep-alive para reducir latencia
+// ✅ FIX 1: reducir retención de servers en memoria (antes 30 min → ahora 5 min)
+const KEEP_MIN  = 5 * 60 * 1000; // 5 min
+
 const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 64 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 const gfetch = (url, opts={}) => {
@@ -24,11 +24,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// ===== Estado =====
-let SERVERS = [];                    // [{jobId, players, maxPlayers, ts}]
-const IDX     = new Map();           // jobId -> index en SERVERS
-const LOCKS   = new Map();           // jobId -> { bot, until }
-let nextCursor = null;               // cursor rotativo para paginar rápido
+let SERVERS = [];                 // [{jobId, players, maxPlayers, ts}]
+const IDX   = new Map();          // jobId -> index
+const LOCKS = new Map();          // jobId -> { bot, until }
+let nextCursor = null;
+let PREVIEW_IDX = 0;              // para rotar en preview (inspección desde el navegador)
 
 const DEFAULT_TTL_MS = 30_000;
 const now = () => Date.now();
@@ -63,15 +63,16 @@ const upsert = (jobId, players, maxPlayers) => {
     SERVERS.push({ jobId, players, maxPlayers, ts: now() });
   } else {
     const s = SERVERS[i];
-    s.players    = (players ?? s.players);
-    s.maxPlayers = (maxPlayers ?? s.maxPlayers);
-    s.ts         = now();
+    if (s) {
+      s.players    = (players ?? s.players);
+      s.maxPlayers = (maxPlayers ?? s.maxPlayers);
+      s.ts         = now();
+    }
   }
 };
 
 const selectServer = ({ maxPlayersCap = 40, minSlotsFree = 0, avoid = [] }) => {
   const avoidSet = new Set((avoid || []).filter(Boolean));
-  // Lineal pero rápido porque lista se mantiene podada y usamos locks
   for (let i = 0; i < SERVERS.length; i++) {
     const s = SERVERS[i]; if (!s) continue;
     const jid = s.jobId; if (!jid) continue;
@@ -88,19 +89,35 @@ const selectServer = ({ maxPlayersCap = 40, minSlotsFree = 0, avoid = [] }) => {
   return null;
 };
 
-// ===== Rutas =====
+// Modo preview: rota circularmente y no mira locks (solo para inspección en navegador)
+const selectServerPreview = ({ maxPlayersCap = 40, minSlotsFree = 0 }) => {
+  if (!SERVERS.length) return null;
+  let tries = 0;
+  const start = PREVIEW_IDX % Math.max(1, SERVERS.length);
+  let idx = start;
+  while (tries < SERVERS.length) {
+    const s = SERVERS[idx];
+    if (s && s.jobId) {
+      const players = Number(s.players ?? 0);
+      const maxP    = Number(s.maxPlayers ?? 40);
+      if (maxP <= maxPlayersCap && (maxP - players) >= minSlotsFree) {
+        PREVIEW_IDX = (idx + 1) % Math.max(1, SERVERS.length);
+        return s;
+      }
+    }
+    idx = (idx + 1) % Math.max(1, SERVERS.length);
+    tries++;
+  }
+  return null;
+};
+
+// ---------- Rutas ----------
 app.get("/", (_req, res) => {
   res.json({ ok: true, msg: "Brainrot API OK", placeId: PLACE_ID, pollMs: POLL_MS, maxPages: MAX_PAGES });
 });
 
 app.get("/stats", (_req, res) => {
-  res.json({
-    ok: true,
-    total: SERVERS.length,
-    locks: LOCKS.size,
-    pollMs: POLL_MS,
-    cursorCached: !!nextCursor
-  });
+  res.json({ ok: true, total: SERVERS.length, locks: LOCKS.size, pollMs: POLL_MS, cursorCached: !!nextCursor });
 });
 
 app.get("/api/all", (_req, res) => {
@@ -120,19 +137,26 @@ app.post("/api/add", (req, res) => {
 });
 
 // GET /next?claim=1&bot=X&ttl=30000&minSlots=1&maxP=40&avoid=a,b
+// GET /next?preview=1&minSlots=1&maxP=40   <-- rota sin claim ni locks (para inspección desde el navegador)
 app.get("/next", (req, res) => {
   try {
-    const wantClaim = String(req.query.claim || "0") === "1";
+    const preview   = String(req.query.preview || "0") === "1";
+    const wantClaim = String(req.query.claim   || "0") === "1";
     const bot       = req.query.bot || "unknown";
     const ttl       = Math.max(1000, Math.min(120000, Number(req.query.ttl || DEFAULT_TTL_MS)));
-    const minSlots  = Math.max(0, Number(req.query.minSlots || 0));
-    const maxP      = Math.max(1, Number(req.query.maxP || 40));
+    const minSlots  = Math.max(0, Number(req.query.minSlots  || 0));
+    const maxP      = Math.max(1, Number(req.query.maxP      || 40));
     const avoid     = (req.query.avoid || "").toString().split(",").map(s => s.trim()).filter(Boolean);
 
-    const s = selectServer({ maxPlayersCap: maxP, minSlotsFree: minSlots, avoid });
-    if (!s) return res.status(204).send();
+    let s = null;
+    if (preview) {
+      s = selectServerPreview({ maxPlayersCap: maxP, minSlotsFree: minSlots });
+    } else {
+      s = selectServer({ maxPlayersCap: maxP, minSlotsFree: minSlots, avoid });
+    }
 
-    if (wantClaim) {
+    if (!s) return res.status(204).send();
+    if (!preview && wantClaim) {
       if (!claim(s.jobId, bot, ttl)) return res.status(409).json({ ok: false, reason: "claimed_by_other" });
     }
     res.json({ ok: true, jobId: s.jobId, players: s.players, maxPlayers: s.maxPlayers, ttl });
@@ -141,18 +165,18 @@ app.get("/next", (req, res) => {
   }
 });
 
-// POST /release { jobId, bot }
 app.post("/release", (req, res) => {
   const { jobId, bot } = req.body || {};
   if (!jobId) return res.status(400).json({ ok: false, error: "missing_jobId" });
   res.json({ ok: release(jobId, bot) });
 });
 
-// ===== Mantenimiento =====
+// ---------- Mantenimiento (locks + poda) ----------
 setInterval(() => {
   // Expirar locks vencidos
   for (const [k, v] of LOCKS.entries()) if (v.until <= now()) LOCKS.delete(k);
-  // Podar servers viejos
+
+  // ✅ FIX 2: poda rápida de servers viejos (KEEP_MIN = 5 min)
   const cutoff = now() - KEEP_MIN;
   for (let i = 0; i < SERVERS.length; i++) {
     const s = SERVERS[i]; if (!s) continue;
@@ -161,25 +185,19 @@ setInterval(() => {
       SERVERS[i] = null;
     }
   }
-  // Compactar esporádicamente si se llena de nulls
+
+  // Compactar si hay muchos huecos
   if (SERVERS.length > 4000) {
     const fresh = [];
     for (const s of SERVERS) if (s) fresh.push(s);
     SERVERS = fresh;
     IDX.clear();
     for (let i = 0; i < SERVERS.length; i++) IDX.set(SERVERS[i].jobId, i);
+    PREVIEW_IDX = PREVIEW_IDX % Math.max(1, SERVERS.length);
   }
 }, 1500);
 
-// ===== FEEDER ULTRA-RÁPIDO (Roblox Public Servers) =====
-/*
-  GET https://games.roblox.com/v1/games/{placeId}/servers/Public?sortOrder=Asc&limit=100&cursor=...
-  Respuesta: { nextPageCursor, data: [{ id, playing, maxPlayers, ...}, ...] }
-  Estrategia:
-  - Cursor rotativo global (nextCursor) → evita empezar SIEMPRE desde el inicio
-  - Múltiples páginas por ciclo (MAX_PAGES)
-  - Filtra servidores llenos (playing < maxPlayers)
-*/
+// ---------- FEEDER ultra-rápido (Roblox Public Servers) ----------
 async function fetchServersPage(placeId, cursor) {
   const base = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100`;
   const url  = cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base;
@@ -195,26 +213,28 @@ async function ultraPoll() {
     while (pages < MAX_PAGES) {
       const json = await fetchServersPage(PLACE_ID, cursor);
       const arr = Array.isArray(json?.data) ? json.data : [];
+
       for (const it of arr) {
         const playing = Number(it.playing ?? 0);
         const maxP    = Number(it.maxPlayers ?? 40);
-        if (playing >= maxP) continue; // evita llenos
+
+        // ✅ FIX 3: ignorar servers vacíos o llenos
+        if (playing <= 0) continue;      // evita vacíos o cerrados
+        if (playing >= maxP) continue;   // evita llenos
+
         upsert(it.id, playing, maxP);
       }
+
       cursor = json?.nextPageCursor || null;
       pages++;
       if (!cursor) break;
     }
-    // Guarda cursor para el próximo ciclo (rotativo → más cobertura)
-    nextCursor = cursor || null;
-  } catch (_e) {
-    // Silencioso para no spamear logs si Roblox rate-limitea puntualmente
-  }
+    nextCursor = cursor || null; // cursor rotativo
+  } catch (_e) { /* silencioso */ }
 }
 
 setInterval(ultraPoll, POLL_MS);
-ultraPoll(); // arranque inmediato
+ultraPoll();
 
-// ===== Start =====
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Brainrot API running :${PORT} | place=${PLACE_ID} | poll=${POLL_MS}ms pages=${MAX_PAGES}`));
+app.listen(PORT, () => console.log(`Brainrot API :${PORT} | place=${PLACE_ID} | poll=${POLL_MS}ms | pages=${MAX_PAGES}`));
