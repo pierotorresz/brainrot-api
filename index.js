@@ -1,20 +1,21 @@
-// index.js
-// ✅ API estable, sin dependencias externas: /next, /report, /confirm, /release, /stats, /all, /health
-// Con locks anti-duplicado, frescura (TTL), y "quarantine" si un bot reporta full/restricted/etc.
+// index.js — API con "recent used" (evitar reusar el mismo server por X minutos)
+// Endpoints: /health, /report, /next, /confirm, /release, /stats, /all
+// Seguridad por x-api-key. Sin dependencias externas (usa http nativo).
 
 const http = require("http");
 const { URL } = require("url");
 
 // ================== CONFIG ==================
 const PORT                   = process.env.PORT || 8000;
-const API_KEY                = process.env.API_KEY || "changeme";       // ⛔ cámbialo en Render
+const API_KEY                = process.env.API_KEY || "changeme";
+
 const MAX_PER_PLACE          = Number(process.env.MAX_PER_PLACE || 500);
 const LOCK_LEASE_SEC         = Number(process.env.LOCK_LEASE_SEC || 90);
-const IGNORE_IF_PLAYERS_GE   = Number(process.env.IGNORE_IF_PLAYERS_GE || 7); // “>6” => 7
+
+const IGNORE_IF_PLAYERS_GE   = Number(process.env.IGNORE_IF_PLAYERS_GE || 7);
 const MIN_FREE_SLOTS_REQ     = Number(process.env.MIN_FREE_SLOTS_REQ || 1);
 
-// Frescura: descartar viejos y preferir nuevos
-const MAX_AGE_MIN            = Number(process.env.MAX_AGE_MIN || 6);     // TTL duro (minutos)
+const MAX_AGE_MIN            = Number(process.env.MAX_AGE_MIN || 6);
 const PREFER_NEWER_BONUS_SEC = Number(process.env.PREFER_NEWER_BONUS_SEC || 120);
 
 // Quarantine al liberar por fallo
@@ -23,32 +24,65 @@ const Q_COOLDOWN_RESTRICTED_SEC  = Number(process.env.Q_COOLDOWN_RESTRICTED_SEC 
 const Q_COOLDOWN_UNAVAILABLE_SEC = Number(process.env.Q_COOLDOWN_UNAVAILABLE_SEC || 90);
 const Q_COOLDOWN_GENERIC_SEC     = Number(process.env.Q_COOLDOWN_GENERIC_SEC || 45);
 
+// 🔸 NUEVO: evitar reusar por X minutos (p.ej. 30)
+const RECENT_USED_TTL_MIN        = Number(process.env.RECENT_USED_TTL_MIN || 30);
+// (opcional) si no hay candidatos por el veto, permitir fallback si el pool
+// visible es bajo (para no quedarnos sin servers en horas muertas)
+const RECENT_USED_MIN_POOL       = Number(process.env.RECENT_USED_MIN_POOL || 50);
+
 // ================== STATE ==================
 const state = Object.create(null);
 const now = () => Date.now();
+
 function getPlace(placeId) {
   if (!state[placeId]) {
     state[placeId] = {
-      items: new Map(),
+      items: new Map(),        // jobId -> record
+      recentUsed: new Map(),   // jobId -> expireTs
       metrics: {
-        totalAdded: 0, totalIgnored: 0, totalLocks: 0,
-        totalConfirms: 0, totalReleases: 0, totalQuarantine: 0
+        totalAdded: 0,
+        totalIgnored: 0,
+        totalLocks: 0,
+        totalConfirms: 0,
+        totalReleases: 0,
+        totalQuarantine: 0
       }
     };
   }
   return state[placeId];
 }
-function n(v, d = 0) { const x = Number(v); return Number.isFinite(x) ? x : d; }
+
+function n(v, d = 0) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+}
+
+function markRecentUsed(p, jobId) {
+  if (RECENT_USED_TTL_MIN <= 0) return;
+  p.recentUsed.set(jobId, now() + RECENT_USED_TTL_MIN * 60_000);
+}
+
 function sweepPlace(placeId) {
   const p = getPlace(placeId);
   const maxAgeMs = MAX_AGE_MIN * 60_000;
   const t = now();
+
+  // Expira items viejos y locks vencidos
   for (const [jobId, rec] of p.items) {
-    if ((t - (rec.lastSeen || rec.ts || 0)) > maxAgeMs) { p.items.delete(jobId); continue; }
+    const seen = rec.lastSeen || rec.ts || 0;
+    if ((t - seen) > maxAgeMs) { p.items.delete(jobId); continue; }
     if (rec.lock && rec.lock.until <= t) rec.lock = null;
     if (rec.coolUntil && rec.coolUntil <= t) delete rec.coolUntil;
   }
+
+  // Expira recentUsed
+  if (p.recentUsed.size) {
+    for (const [jid, exp] of p.recentUsed) {
+      if (exp <= t) p.recentUsed.delete(jid);
+    }
+  }
 }
+
 function send(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -59,30 +93,56 @@ function send(res, code, obj) {
   res.end(body);
 }
 function unauthorized(res) { send(res, 401, { ok: false, error: "Unauthorized" }); }
+
 function parseBody(req) {
-  return new Promise((resolve) => {
-    let data = ""; req.on("data", c => data += c);
-    req.on("end", () => { try { resolve(JSON.parse(data||"{}")); } catch { resolve({}); } });
+  return new Promise(resolve => {
+    let data = "";
+    req.on("data", c => data += c);
+    req.on("end", () => { try { resolve(JSON.parse(data || "{}")); } catch { resolve({}); } });
   });
 }
 function checkKey(req, urlObj) {
   const key = req.headers["x-api-key"] || urlObj.searchParams.get("api_key");
   return key === API_KEY;
 }
+
+// ================== PICKER ==================
 function pickNextRecord(p) {
   const t = now();
   const candidates = [];
+  let visiblePool = 0;
+
+  // 1) Candidatos que no estén lockeados, ni en cooldown, ni en recentUsed
   for (const rec of p.items.values()) {
-    if (!rec.lock && !(rec.coolUntil && rec.coolUntil > t)) candidates.push(rec);
+    const inRecent = RECENT_USED_TTL_MIN > 0 && p.recentUsed.has(rec.jobId) && p.recentUsed.get(rec.jobId) > t;
+    const inCool = !!(rec.coolUntil && rec.coolUntil > t);
+    const locked = !!rec.lock;
+    if (!locked) visiblePool++;
+    if (!locked && !inCool && !inRecent) candidates.push(rec);
   }
+
+  // 2) Si no hay (o son muy pocos) y el pool visible es chico, permitir fallback ignorando recentUsed
+  if (candidates.length === 0 && visiblePool < RECENT_USED_MIN_POOL) {
+    for (const rec of p.items.values()) {
+      const locked = !!rec.lock;
+      const inCool = !!(rec.coolUntil && rec.coolUntil > t);
+      if (!locked && !inCool) candidates.push(rec);
+    }
+  }
+
+  // 3) Fallback extra: expiración de locks o cooldowns
   if (candidates.length === 0) {
     for (const rec of p.items.values()) {
+      const inRecent = RECENT_USED_TTL_MIN > 0 && p.recentUsed.has(rec.jobId) && p.recentUsed.get(rec.jobId) > t;
+      if (inRecent) continue;
       if (rec.lock && rec.lock.until <= t) candidates.push(rec);
       if (rec.coolUntil && rec.coolUntil <= t && !rec.lock) candidates.push(rec);
     }
   }
+
   if (candidates.length === 0) return null;
 
+  // Orden: más slots libres → más reciente (con bonus a "muy nuevo")
   candidates.sort((a, b) => {
     const freeA = (a.maxPlayers || 0) - (a.players || 0);
     const freeB = (b.maxPlayers || 0) - (b.players || 0);
@@ -96,8 +156,11 @@ function pickNextRecord(p) {
 
     return (b.lastSeen || b.ts || 0) - (a.lastSeen || a.ts || 0);
   });
+
   return candidates[0];
 }
+
+// ================== HANDLERS ==================
 async function handleReport(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const body = await parseBody(req);
@@ -113,6 +176,7 @@ async function handleReport(req, res, urlObj) {
 
   const p = getPlace(placeId);
 
+  // Filtros de elegibilidad básicos
   if (restricted === true) { p.metrics.totalIgnored++; return send(res, 200, { ok: true, ignored: true, reason: "restricted" }); }
   if ((maxPlayers && players >= maxPlayers) || players >= IGNORE_IF_PLAYERS_GE) {
     p.metrics.totalIgnored++; return send(res, 200, { ok: true, ignored: true, reason: "server_full_or_players_ge_threshold" });
@@ -123,8 +187,17 @@ async function handleReport(req, res, urlObj) {
 
   sweepPlace(placeId);
 
+  // ❗ NUEVO: si fue usado recientemente, ignorar (evita re-asignarlo durante el TTL)
+  const t = now();
+  const inRecent = RECENT_USED_TTL_MIN > 0 && p.recentUsed.has(jobId) && p.recentUsed.get(jobId) > t;
+  if (inRecent) {
+    p.metrics.totalIgnored++;
+    return send(res, 200, { ok: true, ignored: true, reason: "recently_used" });
+  }
+
+  // Límite de memoria por place
   if (p.items.size >= MAX_PER_PLACE && !p.items.has(jobId)) {
-    let victim = null, oldest = Infinity, t = now();
+    let victim = null, oldest = Infinity;
     for (const [jid, rec] of p.items) {
       if (rec.lock) continue;
       if (rec.coolUntil && rec.coolUntil > t) continue;
@@ -134,7 +207,6 @@ async function handleReport(req, res, urlObj) {
     if (victim) p.items.delete(victim);
   }
 
-  const t = now();
   const rec = p.items.get(jobId) || {
     jobId, placeId, players, maxPlayers, restricted: false, region, ping,
     ts: t, lastSeen: t, lock: null, badCount: 0
@@ -144,11 +216,13 @@ async function handleReport(req, res, urlObj) {
   rec.region = region || rec.region;
   rec.ping = (ping ?? rec.ping);
   rec.lastSeen = t;
+
   p.items.set(jobId, rec);
   if (!rec._added) { p.metrics.totalAdded++; rec._added = true; }
 
   return send(res, 200, { ok: true, stored: true });
 }
+
 async function handleNext(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const placeId = (urlObj.searchParams.get("placeId") || "").toString();
@@ -176,6 +250,7 @@ async function handleNext(req, res, urlObj) {
     ping: rec.ping
   });
 }
+
 async function handleConfirm(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const body = await parseBody(req);
@@ -187,12 +262,17 @@ async function handleConfirm(req, res, urlObj) {
   sweepPlace(placeId);
   if (p.items.has(jobId)) {
     p.items.delete(jobId);
+    markRecentUsed(p, jobId); // evita reuso por TTL
     p.metrics.totalConfirms++;
     return send(res, 200, { ok: true, removed: true });
   } else {
+    // Aunque no esté en items (edge), igualmente marcar como usado reciente
+    markRecentUsed(p, jobId);
+    p.metrics.totalConfirms++;
     return send(res, 200, { ok: true, removed: false, reason: "not_found" });
   }
 }
+
 function applyQuarantine(rec, p, reason) {
   const t = now();
   let cool = Q_COOLDOWN_GENERIC_SEC;
@@ -203,6 +283,7 @@ function applyQuarantine(rec, p, reason) {
   rec.badCount = (rec.badCount || 0) + 1;
   p.metrics.totalQuarantine++;
 }
+
 async function handleRelease(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const body = await parseBody(req);
@@ -214,13 +295,20 @@ async function handleRelease(req, res, urlObj) {
   const p = getPlace(placeId);
   sweepPlace(placeId);
   const rec = p.items.get(jobId);
-  if (!rec) return send(res, 200, { ok: true, released: false, reason: "not_found" });
+  if (!rec) {
+    // aunque no exista ya en items, marca recentUsed para evitar rebotes
+    markRecentUsed(p, jobId);
+    return send(res, 200, { ok: true, released: false, reason: "not_found" });
+  }
 
   rec.lock = null;
   if (reason) applyQuarantine(rec, p, reason);
+  markRecentUsed(p, jobId); // evita reuso por TTL aunque haya fallado
   p.metrics.totalReleases++;
+
   return send(res, 200, { ok: true, released: true, coolUntil: rec.coolUntil || null, badCount: rec.badCount || 0 });
 }
+
 async function handleStats(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const placeId = urlObj.searchParams.get("placeId");
@@ -231,18 +319,23 @@ async function handleStats(req, res, urlObj) {
       ok: true,
       placeId,
       pool: p.items.size,
+      recentUsed: p.recentUsed.size,
       metrics: p.metrics,
-      config: { MAX_PER_PLACE, LOCK_LEASE_SEC, IGNORE_IF_PLAYERS_GE, MIN_FREE_SLOTS_REQ, MAX_AGE_MIN, PREFER_NEWER_BONUS_SEC }
+      config: {
+        MAX_PER_PLACE, LOCK_LEASE_SEC, IGNORE_IF_PLAYERS_GE, MIN_FREE_SLOTS_REQ,
+        MAX_AGE_MIN, PREFER_NEWER_BONUS_SEC, RECENT_USED_TTL_MIN, RECENT_USED_MIN_POOL
+      }
     });
   } else {
     const out = Object.keys(state).map(pid => {
       sweepPlace(pid);
       const p = getPlace(pid);
-      return { placeId: pid, pool: p.items.size, metrics: p.metrics };
+      return { placeId: pid, pool: p.items.size, recentUsed: p.recentUsed.size, metrics: p.metrics };
     });
     return send(res, 200, { ok: true, places: out });
   }
 }
+
 async function handleAll(req, res, urlObj) {
   if (!checkKey(req, urlObj)) return unauthorized(res);
   const placeId = urlObj.searchParams.get("placeId");
