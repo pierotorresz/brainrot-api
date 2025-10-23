@@ -125,4 +125,273 @@ function pickNextRecord(p) {
   if (candidates.length === 0 && visiblePool < RECENT_USED_MIN_POOL) {
     for (const rec of p.items.values()) {
       const locked = !!rec.lock;
-      const inCool = !!(rec.coolUntil &&
+      const inCool = !!(rec.coolUntil && rec.coolUntil > t);
+      if (!locked && !inCool) candidates.push(rec);
+    }
+  }
+
+  // 3) Fallback extra: expiración de locks o cooldowns
+  if (candidates.length === 0) {
+    for (const rec of p.items.values()) {
+      const inRecent = RECENT_USED_TTL_MIN > 0 && p.recentUsed.has(rec.jobId) && p.recentUsed.get(rec.jobId) > t;
+      if (inRecent) continue;
+      if (rec.lock && rec.lock.until <= t) candidates.push(rec);
+      if (rec.coolUntil && rec.coolUntil <= t && !rec.lock) candidates.push(rec);
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Orden: más slots libres → más reciente (con bonus a "muy nuevo")
+  candidates.sort((a, b) => {
+    const freeA = (a.maxPlayers || 0) - (a.players || 0);
+    const freeB = (b.maxPlayers || 0) - (b.players || 0);
+    if (freeB !== freeA) return freeB - freeA;
+
+    const ageA = t - (a.lastSeen || a.ts || 0);
+    const ageB = t - (b.lastSeen || b.ts || 0);
+    const bonusA = ageA <= PREFER_NEWER_BONUS_SEC * 1000 ? 1 : 0;
+    const bonusB = ageB <= PREFER_NEWER_BONUS_SEC * 1000 ? 1 : 0;
+    if (bonusB !== bonusA) return bonusB - bonusA;
+
+    return (b.lastSeen || b.ts || 0) - (a.lastSeen || a.ts || 0);
+  });
+
+  return candidates[0];
+}
+
+// ================== HANDLERS ==================
+async function handleReport(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const body = await parseBody(req);
+  const placeId = (body.placeId || "").toString();
+  const jobId   = (body.jobId || "").toString();
+  if (!placeId || !jobId) return send(res, 400, { ok: false, error: "placeId and jobId are required" });
+
+  const players    = n(body.players);
+  const maxPlayers = n(body.maxPlayers);
+  const restricted = !!body.restricted;
+  const region     = (body.region ?? "").toString();
+  const ping       = Number.isFinite(Number(body.ping)) ? Number(body.ping) : null;
+
+  const p = getPlace(placeId);
+
+  // Filtros de elegibilidad básicos
+  if (restricted === true) { p.metrics.totalIgnored++; return send(res, 200, { ok: true, ignored: true, reason: "restricted" }); }
+  if ((maxPlayers && players >= maxPlayers) || players >= IGNORE_IF_PLAYERS_GE) {
+    p.metrics.totalIgnored++; return send(res, 200, { ok: true, ignored: true, reason: "server_full_or_players_ge_threshold" });
+  }
+  if (maxPlayers && (maxPlayers - players) < MIN_FREE_SLOTS_REQ) {
+    p.metrics.totalIgnored++; return send(res, 200, { ok: true, ignored: true, reason: "not_enough_free_slots" });
+  }
+
+  sweepPlace(placeId);
+
+  // ❗ NUEVO: si fue usado recientemente, ignorar (evita re-asignarlo durante el TTL)
+  const t = now();
+  const inRecent = RECENT_USED_TTL_MIN > 0 && p.recentUsed.has(jobId) && p.recentUsed.get(jobId) > t;
+  if (inRecent) {
+    p.metrics.totalIgnored++;
+    return send(res, 200, { ok: true, ignored: true, reason: "recently_used" });
+  }
+
+  // Límite de memoria por place
+  if (p.items.size >= MAX_PER_PLACE && !p.items.has(jobId)) {
+    let victim = null, oldest = Infinity;
+    for (const [jid, rec] of p.items) {
+      if (rec.lock) continue;
+      if (rec.coolUntil && rec.coolUntil > t) continue;
+      const ts = rec.ts || rec.lastSeen || 0;
+      if (ts < oldest) { oldest = ts; victim = jid; }
+    }
+    if (victim) p.items.delete(victim);
+  }
+
+  const rec = p.items.get(jobId) || {
+    jobId, placeId, players, maxPlayers, restricted: false, region, ping,
+    ts: t, lastSeen: t, lock: null, badCount: 0
+  };
+  rec.players = players;
+  rec.maxPlayers = maxPlayers || rec.maxPlayers;
+  rec.region = region || rec.region;
+  rec.ping = (ping ?? rec.ping);
+  rec.lastSeen = t;
+
+  p.items.set(jobId, rec);
+  if (!rec._added) { p.metrics.totalAdded++; rec._added = true; }
+
+  return send(res, 200, { ok: true, stored: true });
+}
+
+async function handleNext(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const placeId = (urlObj.searchParams.get("placeId") || "").toString();
+  const botId   = (urlObj.searchParams.get("botId") || "").toString() || ("bot_" + Math.random().toString(36).slice(2));
+  const peek    = String(urlObj.searchParams.get("peek") || "false").toLowerCase() === "true";
+  if (!placeId) return send(res, 400, { ok: false, error: "placeId is required" });
+
+  sweepPlace(placeId);
+  const p = getPlace(placeId);
+  const rec = pickNextRecord(p);
+  if (!rec) return send(res, 200, { ok: true, jobId: null, reason: "empty_pool" });
+
+  if (!peek) {
+    rec.lock = { by: botId, until: now() + LOCK_LEASE_SEC * 1000 };
+    p.metrics.totalLocks++;
+  }
+  send(res, 200, {
+    ok: true,
+    jobId: rec.jobId,
+    placeId,
+    lock: peek ? null : rec.lock,
+    players: rec.players,
+    maxPlayers: rec.maxPlayers,
+    region: rec.region,
+    ping: rec.ping
+  });
+}
+
+async function handleConfirm(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const body = await parseBody(req);
+  const placeId = (body.placeId || "").toString();
+  const jobId   = (body.jobId || "").toString();
+  if (!placeId || !jobId) return send(res, 400, { ok: false, error: "placeId and jobId are required" });
+
+  const p = getPlace(placeId);
+  sweepPlace(placeId);
+  if (p.items.has(jobId)) {
+    p.items.delete(jobId);
+    markRecentUsed(p, jobId); // evita reuso por TTL
+    p.metrics.totalConfirms++;
+    return send(res, 200, { ok: true, removed: true });
+  } else {
+    // Aunque no esté en items (edge), igualmente marcar como usado reciente
+    markRecentUsed(p, jobId);
+    p.metrics.totalConfirms++;
+    return send(res, 200, { ok: true, removed: false, reason: "not_found" });
+  }
+}
+
+function applyQuarantine(rec, p, reason) {
+  const t = now();
+  let cool = Q_COOLDOWN_GENERIC_SEC;
+  if (reason === "Full") cool = Q_COOLDOWN_FULL_SEC;
+  else if (reason === "Restricted") cool = Q_COOLDOWN_RESTRICTED_SEC;
+  else if (reason === "Unavailable") cool = Q_COOLDOWN_UNAVAILABLE_SEC;
+  rec.coolUntil = t + cool * 1000;
+  rec.badCount = (rec.badCount || 0) + 1;
+  p.metrics.totalQuarantine++;
+}
+
+async function handleRelease(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const body = await parseBody(req);
+  const placeId = (body.placeId || "").toString();
+  const jobId   = (body.jobId || "").toString();
+  const reason  = (body.reason || "").toString();
+  if (!placeId || !jobId) return send(res, 400, { ok: false, error: "placeId and jobId are required" });
+
+  const p = getPlace(placeId);
+  sweepPlace(placeId);
+  const rec = p.items.get(jobId);
+  if (!rec) {
+    // aunque no exista ya en items, marca recentUsed para evitar rebotes
+    markRecentUsed(p, jobId);
+    return send(res, 200, { ok: true, released: false, reason: "not_found" });
+  }
+
+  rec.lock = null;
+  if (reason) applyQuarantine(rec, p, reason);
+  markRecentUsed(p, jobId); // evita reuso por TTL aunque haya fallado
+  p.metrics.totalReleases++;
+
+  return send(res, 200, { ok: true, released: true, coolUntil: rec.coolUntil || null, badCount: rec.badCount || 0 });
+}
+
+async function handleStats(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const placeId = urlObj.searchParams.get("placeId");
+  if (placeId) {
+    sweepPlace(placeId);
+    const p = getPlace(placeId);
+    return send(res, 200, {
+      ok: true,
+      placeId,
+      pool: p.items.size,
+      recentUsed: p.recentUsed.size,
+      metrics: p.metrics,
+      config: {
+        MAX_PER_PLACE, LOCK_LEASE_SEC, IGNORE_IF_PLAYERS_GE, MIN_FREE_SLOTS_REQ,
+        MAX_AGE_MIN, PREFER_NEWER_BONUS_SEC, RECENT_USED_TTL_MIN, RECENT_USED_MIN_POOL
+      }
+    });
+  } else {
+    const out = Object.keys(state).map(pid => {
+      sweepPlace(pid);
+      const p = getPlace(pid);
+      return { placeId: pid, pool: p.items.size, recentUsed: p.recentUsed.size, metrics: p.metrics };
+    });
+    return send(res, 200, { ok: true, places: out });
+  }
+}
+
+async function handleAll(req, res, urlObj) {
+  if (!checkKey(req, urlObj)) return unauthorized(res);
+  const placeId = urlObj.searchParams.get("placeId");
+  if (!placeId) return send(res, 400, { ok: false, error: "placeId is required" });
+
+  sweepPlace(placeId);
+  const p = getPlace(placeId);
+  const rows = [];
+  for (const rec of p.items.values()) {
+    rows.push({
+      jobId: rec.jobId,
+      players: rec.players,
+      maxPlayers: rec.maxPlayers,
+      hasLock: !!rec.lock,
+      lockBy: rec.lock?.by || null,
+      lockUntil: rec.lock?.until || null,
+      coolUntil: rec.coolUntil || null,
+      badCount: rec.badCount || 0,
+      ts: rec.ts,
+      lastSeen: rec.lastSeen
+    });
+  }
+  return send(res, 200, { ok: true, total: rows.length, rows });
+}
+
+// ================== ROUTER ==================
+const server = http.createServer(async (req, res) => {
+  const urlObj = new URL(req.url, `http://${req.headers.host}`);
+  const path = urlObj.pathname;
+  const method = req.method.toUpperCase();
+
+  // CORS preflight
+  if (method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type,x-api-key",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    });
+    return res.end();
+  }
+
+  try {
+    if (method === "GET"  && (path === "/health" || path === "/api/health"))  return send(res, 200, { ok: true, status: "healthy", time: new Date().toISOString() });
+    if (method === "POST" && (path === "/report" || path === "/api/report"))  return await handleReport(req, res, urlObj);
+    if (method === "GET"  && (path === "/next"   || path === "/api/next"))    return await handleNext(req, res, urlObj);
+    if (method === "POST" && (path === "/confirm"|| path === "/api/confirm")) return await handleConfirm(req, res, urlObj);
+    if (method === "POST" && (path === "/release"|| path === "/api/release")) return await handleRelease(req, res, urlObj);
+    if (method === "GET"  && (path === "/stats"  || path === "/api/stats"))   return await handleStats(req, res, urlObj);
+    if (method === "GET"  && (path === "/all"    || path === "/api/all"))     return await handleAll(req, res, urlObj);
+
+    return send(res, 404, { ok: false, error: "Not found" });
+  } catch (e) {
+    return send(res, 500, { ok: false, error: "Server error", details: String(e && e.message || e) });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`[roblox-jobid-api] listening on :${PORT}`);
+});
