@@ -1,7 +1,7 @@
 // index.js — EN+ JobId API (desde cero)
 // - Evita reusar servers por 10 min (TTL global).
 // - Locks por botId (no asigna el mismo JobId a dos bots a la vez).
-// - Preferencia: servidores frescos y con < 6 jugadores.
+// - Preferencia: servidores frescos y con < 6 jugadores (filtro duro).
 // - Si un bot libera por "Full/Restricted/Unavailable", se enfría ese job (cooldown).
 // - Endpoints: /api/health, /api/report, /api/next, /api/confirm, /api/release, /api/stats, /api/all
 // HTTP nativo (sin dependencias). Autenticación por x-api-key.
@@ -20,7 +20,7 @@ const LOCK_HEARTBEAT_EXTEND_SEC   = Number(process.env.LOCK_HEARTBEAT_EXTEND_SEC
 const HEARTBEAT_MAX_SEC           = Number(process.env.HEARTBEAT_MAX_SEC || 120);
 
 const MAX_AGE_MIN                 = Number(process.env.MAX_AGE_MIN || 10); // descarta reportes viejos
-const ACCEPT_IF_PLAYERS_LT        = Number(process.env.ACCEPT_IF_PLAYERS_LT || 6); // preferimos <6
+const ACCEPT_IF_PLAYERS_LT        = Number(process.env.ACCEPT_IF_PLAYERS_LT || 6); // preferimos <6 (filtro duro)
 const MIN_FREE_SLOTS_REQ          = Number(process.env.MIN_FREE_SLOTS_REQ || 0);   // no exigimos hueco extra
 
 const RECENT_USED_TTL_MIN         = Number(process.env.RECENT_USED_TTL_MIN || 10); // *** 10 min ***
@@ -97,24 +97,16 @@ function pickNextRecord(p, botId){
 
     if (!locked) visible++;
     if (!locked && !inCool && !inRecent && !inGrace){
-      // Filtro “preferimos < ACCEPT_IF_PLAYERS_LT”
+      // Preferencia dura: solo < ACCEPT_IF_PLAYERS_LT
       if (n(rec.players,0) < ACCEPT_IF_PLAYERS_LT) candidates.push(rec);
     }
   }
 
-  // Si no hay candidatos “<6”, probá con cualquiera no vetado
-  if (candidates.length===0){
-    for (const rec of p.items.values()){
-      const inRecent = RECENT_USED_TTL_MIN>0 && p.recentUsed.has(rec.jobId) && p.recentUsed.get(rec.jobId)>t;
-      const inCool   = !!(rec.coolUntil && rec.coolUntil>t);
-      const locked   = !!rec.lock;
-      const inGrace  = !!(rec.reassignAfter && rec.reassignAfter>t);
-      if (!locked && !inCool && !inRecent && !inGrace) candidates.push(rec);
-    }
-  }
+  // ⚠️ Sin fallback: si no hay <6, devolvemos null para que /next responda empty_pool
+  // (el bot reintenta en LOOP_WAIT y evitamos caer a 6–8/8)
 
-  // BYPASS (opcional) si pool visible es chico
-  if (candidates.length===0 && visible < RECENT_USED_MIN_POOL){
+  // BYPASS (opcional) si pool visible es chico — desactivado si RECENT_USED_MIN_POOL=0
+  if (candidates.length===0 && visible < RECENT_USED_MIN_POOL && RECENT_USED_MIN_POOL>0){
     for (const rec of p.items.values()){
       const locked = !!rec.lock;
       const inCool = !!(rec.coolUntil && rec.coolUntil>t);
@@ -156,14 +148,25 @@ async function handleReport(req,res,u){
   const p=getPlace(placeId);
   sweepPlace(placeId);
 
-  if (restricted){ p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"restricted"}); }
-  // No rechazamos por 8/8; usamos preferencia (<6) y cooldowns. Si querés bloquear llenos, usa MIN_FREE_SLOTS_REQ>0.
-  if (maxPlayers && (maxPlayers-players)<MIN_FREE_SLOTS_REQ){ p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"not_enough_free_slots"}); }
-
-  // TTL “recentUsed” global (no reinyectar si se usó hace < TTL)
+  // Deduplicación fuerte: si ya existe activo o en recentUsed, ignorar
   const t=now();
+  if (p.items.has(jobId)){
+    p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"duplicate_jobid"});
+  }
   if (RECENT_USED_TTL_MIN>0 && p.recentUsed.has(jobId) && p.recentUsed.get(jobId)>t){
     p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"recently_used"});
+  }
+
+  if (restricted){ p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"restricted"}); }
+
+  // Filtro duro: solo guardamos servidores con players < ACCEPT_IF_PLAYERS_LT (por defecto 6)
+  if (players >= ACCEPT_IF_PLAYERS_LT){
+    p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"players_ge_cap"});
+  }
+
+  // (opcional) slots libres mínimos
+  if (maxPlayers && (maxPlayers-players)<MIN_FREE_SLOTS_REQ){
+    p.metrics.totalIgnored++; return send(res,200,{ok:true,ignored:true,reason:"not_enough_free_slots"});
   }
 
   // Capacidad
@@ -178,11 +181,9 @@ async function handleReport(req,res,u){
     if (victim) p.items.delete(victim);
   }
 
-  const rec=p.items.get(jobId)||{ jobId, placeId, players, maxPlayers, region, ping, ts:t, lastSeen:t, lock:null, badCount:0 };
-  rec.players=players; rec.maxPlayers=maxPlayers||rec.maxPlayers; rec.region=region||rec.region; rec.ping=(ping??rec.ping); rec.lastSeen=t;
+  const rec={ jobId, placeId, players, maxPlayers, region, ping, ts:t, lastSeen:t, lock:null, badCount:0 };
   p.items.set(jobId,rec);
-  if(!rec._added){ p.metrics.totalAdded++; rec._added=true; }
-
+  p.metrics.totalAdded++;
   send(res,200,{ok:true,stored:true});
 }
 
