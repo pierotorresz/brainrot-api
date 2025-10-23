@@ -1,7 +1,11 @@
 {
-  "name": "brainrot-api",
+  "name": "jobid-api",
   "version": "1.0.0",
+  "description": "EN+ JobId Pool API",
   "main": "index.js",
-  "type": "commonjs",
-  "scripts": { "start": "node index.js" }
+  "scripts": {
+    "start": "node index.js",
+    "health": "node -e \"require('http').get('http://127.0.0.1:'+(process.env.PORT||8000)+'/api/health',r=>r.resume())\""
+  },
+  "license": "MIT"
 }
