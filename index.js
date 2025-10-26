@@ -12,7 +12,7 @@ const bodyParser = require("body-parser");
 
 // ===== ENV =====
 const PORT                      = Number(process.env.PORT || 10000);
-const API_KEY                   = process.env.API_KEY || "changeme";
+const API_KEY                   = process.env.API_KEY || "bR4nR0t-9f3a2c7b-6d1e-4a2b-8c3d-5f6a7b8c9d0e";
 
 const MAX_PER_PLACE             = Number(process.env.MAX_PER_PLACE || 1000);
 
@@ -46,7 +46,6 @@ app.use(bodyParser.json());
 const places = new Map();
 
 function now() { return Date.now(); }
-function sec(ms) { return Math.floor(ms / 1000); }
 
 function ensurePlace(placeId) {
   if (!places.has(placeId)) {
@@ -306,4 +305,5 @@ app.get("/api/stats", auth, (req, res) => {
 // ===== START =====
 app.listen(PORT, () => {
   console.log(`[brainrot-api] listening on :${PORT}`);
+  console.log(`[brainrot-api] API_KEY=${API_KEY}`);
 });
