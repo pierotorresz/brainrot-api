@@ -1,0 +1,19 @@
+{
+  "name": "brainrot-api",
+  "version": "1.0.0",
+  "description": "Brainrot pool API compatible with hopper + external scanner",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "start:dev": "NODE_ENV=development node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
