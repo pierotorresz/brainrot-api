@@ -120,8 +120,18 @@ app.get("/", (req, res) => {
 
 // Reporta un server descubierto por el scanner
 app.post("/api/report", auth, (req, res) => {
-  const { placeId, jobId, players = 0, maxPlayers = 8, region = "", ping = 0, restricted = false } = req.body || {};
-  if (!placeId || !jobId) return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  const {
+    placeId,
+    jobId,
+    players = 0,
+    maxPlayers = 8,
+    region = "",
+    ping = 0,
+    restricted = false
+  } = req.body || {};
+  if (!placeId || !jobId) {
+    return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  }
 
   const place = ensurePlace(String(placeId));
   cleanupPlaceState(place);
@@ -143,8 +153,10 @@ app.post("/api/report", auth, (req, res) => {
     return res.json({ ok: true, stored: false, reason: "pool_full" });
   }
 
-  // Insert / update
   const existed = place.pool.has(jobId);
+  const prev = existed ? place.pool.get(jobId) : null;
+
+  // Insert / update
   place.pool.set(jobId, {
     jobId,
     players,
@@ -152,8 +164,10 @@ app.post("/api/report", auth, (req, res) => {
     region,
     ping,
     reportedAt: now(),
-    lastAssignedAt: 0,
-    lock: existed ? place.pool.get(jobId).lock : undefined
+    // 🔧 Mantenemos lastAssignedAt si ya existía (no reseteamos el delay)
+    lastAssignedAt: existed && prev.lastAssignedAt ? prev.lastAssignedAt : 0,
+    // 🔧 Mantenemos lock si ya existía
+    lock: existed ? prev.lock : undefined
   });
 
   if (!existed) place.metrics.totalAdded++;
@@ -163,7 +177,9 @@ app.post("/api/report", auth, (req, res) => {
 // Hopper pide un server
 app.post("/api/next", auth, (req, res) => {
   const { placeId, botId = "unknown" } = req.body || {};
-  if (!placeId) return res.status(400).json({ ok: false, error: "missing placeId" });
+  if (!placeId) {
+    return res.status(400).json({ ok: false, error: "missing placeId" });
+  }
 
   const place = ensurePlace(String(placeId));
   cleanupPlaceState(place);
@@ -195,6 +211,7 @@ app.post("/api/next", auth, (req, res) => {
   // Pick best by score
   candidates.sort((a, b) => scoreEntry(b) - scoreEntry(a));
   const picked = candidates[0];
+
   picked.lock = {
     botId,
     assignedAt: t,
@@ -203,8 +220,12 @@ app.post("/api/next", auth, (req, res) => {
   };
   picked.lastAssignedAt = t;
 
-  const placeStats = ensurePlace(String(placeId));
-  placeStats.metrics.totalLocks++;
+  // 🔑 CLAVE: marcar como recentUsed EN EL MOMENTO que lo asignamos,
+  // para que ningún otro bot vuelva a este jobId durante RECENT_USED_TTL_MIN.
+  const ruTTL = RECENT_USED_TTL_MIN * 60000;
+  place.recentUsed.set(picked.jobId, t + ruTTL);
+
+  place.metrics.totalLocks++;
 
   res.json({
     ok: true,
@@ -221,7 +242,9 @@ app.post("/api/next", auth, (req, res) => {
 // Hopper confirma (heartbeat) cuando llega
 app.post("/api/confirm", auth, (req, res) => {
   const { placeId, jobId, botId = "unknown" } = req.body || {};
-  if (!placeId || !jobId) return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  if (!placeId || !jobId) {
+    return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  }
 
   const place = ensurePlace(String(placeId));
   cleanupPlaceState(place);
@@ -243,10 +266,8 @@ app.post("/api/confirm", auth, (req, res) => {
   entry.lock.expiresAt = t + LOCK_HEARTBEAT_EXTEND_SEC * 1000;
   entry.lock.heartbeats += 1;
 
-  // Marca como recentUsed (veto)
-  const ruTTL = RECENT_USED_TTL_MIN * 60000;
-  place.recentUsed.set(jobId, t + ruTTL);
-
+  // OJO: ya marcamos recentUsed en /api/next.
+  // Aquí solo mantenemos stats y lease.
   place.metrics.totalConfirms++;
   res.json({ ok: true, extendedLeaseSec: LOCK_HEARTBEAT_EXTEND_SEC });
 });
@@ -254,7 +275,9 @@ app.post("/api/confirm", auth, (req, res) => {
 // Hopper libera explícitamente (full/restricted/unavailable)
 app.post("/api/release", auth, (req, res) => {
   const { placeId, jobId, reason = "unknown", quarantine = false } = req.body || {};
-  if (!placeId || !jobId) return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  if (!placeId || !jobId) {
+    return res.status(400).json({ ok: false, error: "missing placeId/jobId" });
+  }
 
   const place = ensurePlace(String(placeId));
   cleanupPlaceState(place);
