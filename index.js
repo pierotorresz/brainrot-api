@@ -29,7 +29,7 @@ const createdAt = {};     // jobId → timestamp cuando se agregó
 const pointers = {};      // placeId → índice RR
 
 // === CONFIG LIMPIEZA ===
-const JOB_TTL = 160;      // borrar servers viejos >160s
+const JOB_TTL = 300;      // borrar servers viejos >160s
 const LOCK_TTL = 12;      // lock que dura más de 12s se elimina
 const MAX_FAILS = 3;      // borrar jobId tras 3 fallos
 
