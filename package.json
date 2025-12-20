@@ -1,12 +1,11 @@
 {
   "name": "brainrot-api",
-  "version": "1.0.0",
-  "description": "Brainrot pool API compatible with hopper + external scanner",
+  "version": "3.1.0",
+  "description": "Brainrot pool API with dedupe + /server,/remove compat",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
-    "start:dev": "NODE_ENV=development node index.js"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=18"
