@@ -330,6 +330,15 @@ setInterval(() => {
   }
 }, 20000);
 
+// NUEVO: Link rápido para ver solo el conteo total
+app.get("/count", (req, res) => {
+  let total = 0;
+  for (const id in pools) {
+    total += pools[id].length;
+  }
+  res.send(`<h1>Pool Total: ${total} servidores</h1>`);
+});
+
 // Start
 app.listen(PORT, () => {
   console.log("API Brainrot v3.1 DEDUPE+COMPAT running on port", PORT);
