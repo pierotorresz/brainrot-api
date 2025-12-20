@@ -9,11 +9,10 @@ app.use(cors());
 app.use(bodyParser.json());
 
 const PORT = Number(process.env.PORT || 10000);
-const API_KEY = process.env.API_KEY || "bR4nR0t-9f3a2c7b-6d1e-4a2b-8c3d-5f6a7b8c9d0e";
 
 // --- Stores ---
 const pools = {};         
-const locks = {};         // jobId -> { botId, timestamp }
+const locks = {};         
 const recentUsed = {};    
 const failCount = {};     
 const createdAt = {};     
@@ -21,13 +20,13 @@ const pointers = {};
 const seenRecent = {};    
 let serverDetails = [];   
 
-// --- Configuración Antiduplicado ---
-const JOB_TTL = 300;
-const LOCK_TTL = 30;      // Aumentado a 30s para dar tiempo al bot a entrar
+// --- Configuración para Escala Masiva (300 Bots) ---
+const JOB_TTL = 450;       // El JobID vive más tiempo en la lista
+const LOCK_TTL = 60;       // Bloqueo de 1 minuto para evitar colisiones por carga lenta
 const MAX_FAILS = 3;
-const RECENT_USED_TTL = 15;
-const SEEN_TTL = 300;
-const MAX_DETAILS_SIZE = 150;
+const RECENT_USED_TTL = 30; // Evita que el mismo ID sea sugerido muy rápido
+const SEEN_TTL = 600;      // Dedupe de 10 min para no repetir escaneos innecesarios
+const MAX_DETAILS_SIZE = 250; 
 
 function now() { return Math.floor(Date.now() / 1000); }
 
@@ -38,32 +37,31 @@ function ensurePlace(placeId) {
 
 function isValidJobId(jobId) { return typeof jobId === "string" && jobId.length > 5; }
 
-// selector con LOCKING ESTRICTO
 function pickNextJobId(placeId, botId) {
     ensurePlace(placeId);
     const list = pools[placeId];
     if (!list || list.length === 0) return null;
 
     const t = now();
-    // Empezamos en un punto aleatorio para distribuir bots
+    // Salto aleatorio mayor para dispersar a los 300 bots en toda la lista
     const start = Math.floor(Math.random() * list.length);
 
     for (let i = 0; i < list.length; i++) {
         const idx = (start + i) % list.length;
         const jobId = list[idx];
 
-        // Filtros de limpieza
         if (createdAt[jobId] && (t - createdAt[jobId] > JOB_TTL)) continue;
         if ((failCount[jobId] || 0) >= MAX_FAILS) continue;
 
-        // Lógica de Bloqueo Exclusivo
+        // Bloqueo Estricto
         const lock = locks[jobId];
         if (lock && (t - lock.timestamp < LOCK_TTL)) {
-            // Si el lock no es mío, el servidor está ocupado por otro bot
             if (lock.botId !== botId) continue;
         }
 
-        // Asignación de Lock
+        // Si se usó recientemente por CUALQUIERA, esperar un poco (distribución uniforme)
+        if (recentUsed[jobId] && (t - recentUsed[jobId] < RECENT_USED_TTL)) continue;
+
         locks[jobId] = { botId: botId, timestamp: t };
         recentUsed[jobId] = t;
         return jobId;
@@ -72,7 +70,6 @@ function pickNextJobId(placeId, botId) {
 }
 
 // --- Endpoints ---
-
 app.post("/api/report", (req, res) => {
     const { placeId, servers, details } = req.body || {};
     if (!placeId) return res.status(400).send("no_placeid");
@@ -110,21 +107,13 @@ app.post("/api/report", (req, res) => {
 
 app.get("/server", (req, res) => {
     const placeId = req.query.placeId;
-    const botId = req.headers["username"] || "unknown_bot";
+    const botId = req.headers["username"] || "bot_" + Math.random().toString(36).substring(7);
     if (!placeId) return res.status(400).send("");
 
     const jobId = pickNextJobId(String(placeId), botId);
     res.status(200).send(jobId || "");
 });
 
-app.get("/api/all", (req, res) => {
-    res.json(serverDetails);
-});
+app.get("/api/all", (req, res) => res.json(serverDetails));
 
-app.get("/count", (req, res) => {
-    let total = 0;
-    for (const id in pools) total += pools[id].length;
-    res.send(`Bots activos viendo ${total} servers. Detallados: ${serverDetails.length}`);
-});
-
-app.listen(PORT, () => console.log(`API v3.3 Anti-Dupe en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`API v3.4 300-BOTS-READY en puerto ${PORT}`));
